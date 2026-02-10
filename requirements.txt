@@ -1,5 +1,2 @@
 discord.py
 yt-dlp
-qrcode
-requests
-PyNaCl
