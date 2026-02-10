@@ -1,274 +1,190 @@
 import discord
-from discord.ext import commands
 from discord import app_commands
-import os, re, zipfile, tempfile, base64, random, string
-from collections import defaultdict
+from discord.ext import commands
+import base64, random, string, tempfile, os, time, ast
+import yt_dlp
+import qrcode
+import requests
 
-# ================= CONFIG =================
-TOKEN = "ISI_TOKEN_DISCORD_KAMU"
-SCAN_CHANNEL_ID = 1469740150522380299
-
-MAX_SIZE = 7 * 1024 * 1024        # 7 MB
-MAX_FILES_ZIP = 120              # anti zip bomb
-MAX_UNZIP_SIZE = 20 * 1024 * 1024
-
-ALLOWED_EXT = (".lua", ".luac", ".zip")
+TOKEN = "ISI_TOKEN_BOT_KAMU"
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ================= DETECTION =================
-KEYLOGGER_PATTERN = [
-    r'GetAsyncKeyState',
-    r'keylog',
-    r'RegisterRawInputDevices'
-]
+start_time = time.time()
 
-DISCORD_WEBHOOK = r"https://discord\.com/api/webhooks/"
-TELEGRAM_BOT = r"bot\d{8,10}:[A-Za-z0-9_-]{35}"
+# ======================
+# UTIL
+# ======================
+def rand_var():
+    return ''.join(random.choices(string.ascii_letters, k=8))
 
-DANGEROUS_FUNC = [
-    r'loadstring',
-    r'os.execute',
-    r'io.popen',
-    r'dofile',
-    r'require\s*\(\s*[\'"]socket'
-]
+def obfuscate_code(text, level):
+    if level == "low":
+        encoded = base64.b64encode(text.encode()).decode()
+        return f'import base64\nexec(base64.b64decode("{encoded}").decode())'
 
-def scan_content(content: str):
-    return {
-        "keylogger": any(re.search(p, content, re.I) for p in KEYLOGGER_PATTERN),
-        "webhook": re.search(DISCORD_WEBHOOK, content) is not None,
-        "telegram": re.search(TELEGRAM_BOT, content) is not None,
-        "danger": any(re.search(p, content, re.I) for p in DANGEROUS_FUNC),
+    elif level == "medium":
+        encoded = base64.b64encode(text.encode()).decode()[::-1]
+        v = rand_var()
+        return f'import base64\n{v}="{encoded}"\nexec(base64.b64decode({v}[::-1]).decode())'
+
+    elif level == "hard":
+        encoded = base64.b64encode(text.encode()).decode()
+        parts = [encoded[i:i+10] for i in range(0, len(encoded), 10)]
+        var = rand_var()
+        joined = " + ".join([f'"{p}"' for p in parts])
+        return f'import base64\n{var} = {joined}\nexec(base64.b64decode({var}).decode())'
+
+# ======================
+# SAFE CALC
+# ======================
+def safe_calc(expr):
+    tree = ast.parse(expr, mode="eval")
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Expression, ast.BinOp, ast.UnaryOp,
+                                 ast.Num, ast.Add, ast.Sub, ast.Mult,
+                                 ast.Div, ast.Pow, ast.Mod)):
+            raise ValueError("Invalid expression")
+    return eval(compile(tree, "<calc>", "eval"))
+
+# ======================
+# OBF VIEW
+# ======================
+class ObfView(discord.ui.View):
+    def __init__(self, file):
+        super().__init__(timeout=60)
+        self.file = file
+
+    async def process(self, interaction, level):
+        data = await self.file.read()
+        text = data.decode("utf-8", errors="ignore")
+        result = obfuscate_code(text, level)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".py") as tmp:
+            tmp.write(result.encode())
+            filename = tmp.name
+
+        await interaction.response.send_message(
+            content=f"✅ **Obfuscation {level.upper()} berhasil!**",
+            file=discord.File(filename, f"obf_{level}.py"),
+            ephemeral=True
+        )
+        os.unlink(filename)
+
+    @discord.ui.button(label="🟢 LOW", style=discord.ButtonStyle.success)
+    async def low(self, interaction: discord.Interaction, _):
+        await self.process(interaction, "low")
+
+    @discord.ui.button(label="🟡 MEDIUM", style=discord.ButtonStyle.primary)
+    async def medium(self, interaction: discord.Interaction, _):
+        await self.process(interaction, "medium")
+
+    @discord.ui.button(label="🔴 HARD", style=discord.ButtonStyle.danger)
+    async def hard(self, interaction: discord.Interaction, _):
+        await self.process(interaction, "hard")
+
+# ======================
+# MENU
+# ======================
+@bot.tree.command(name="menu")
+async def menu(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📌 BOT MENU",
+        description="🤖 Bot AI + Tools + Downloader + Obfuscation",
+        color=0x00ffcc
+    )
+    embed.add_field(name="🛡️ Security", value="🔐 `/obf`", inline=False)
+    embed.add_field(name="📥 Download", value="🎥 `/youtube`", inline=False)
+    embed.add_field(name="🧰 Tools", value="/ping /uptime /calc /qr /poll", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ======================
+# COMMANDS
+# ======================
+@bot.tree.command(name="obf")
+@app_commands.describe(file="Upload script")
+async def obf(interaction: discord.Interaction, file: discord.Attachment):
+    embed = discord.Embed(
+        title="🛡️ OBFUSCATION",
+        description="Pilih level obfuscation",
+        color=0x2ecc71
+    )
+    await interaction.response.send_message(embed=embed, view=ObfView(file), ephemeral=True)
+
+@bot.tree.command(name="ping")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("🏓 Pong!")
+
+@bot.tree.command(name="uptime")
+async def uptime(interaction: discord.Interaction):
+    seconds = int(time.time() - start_time)
+    await interaction.response.send_message(f"⏰ Uptime: {seconds}s")
+
+@bot.tree.command(name="calc")
+async def calc(interaction: discord.Interaction, expr: str):
+    try:
+        result = safe_calc(expr)
+        await interaction.response.send_message(f"🧮 Hasil: {result}")
+    except:
+        await interaction.response.send_message("❌ Ekspresi tidak valid")
+
+@bot.tree.command(name="qr")
+async def qr_cmd(interaction: discord.Interaction, text: str):
+    filename = f"qr_{interaction.user.id}.png"
+    img = qrcode.make(text)
+    img.save(filename)
+    await interaction.response.send_message(file=discord.File(filename))
+    os.unlink(filename)
+
+@bot.tree.command(name="poll")
+async def poll(interaction: discord.Interaction, question: str):
+    await interaction.response.send_message(f"📊 **Poll:** {question}")
+    msg = await interaction.original_response()
+    await msg.add_reaction("👍")
+    await msg.add_reaction("👎")
+
+# ======================
+# YOUTUBE
+# ======================
+@bot.tree.command(name="youtube")
+async def youtube(interaction: discord.Interaction, url: str):
+    await interaction.response.defer()
+
+    ydl_opts = {
+        "format": "mp4",
+        "outtmpl": "%(title)s.%(ext)s",
+        "quiet": True
     }
 
-# ================= ZIP SAFETY =================
-def zip_safe(zip_path):
-    try:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            if len(z.infolist()) > MAX_FILES_ZIP:
-                return False
-            total = sum(i.file_size for i in z.infolist())
-            if total > MAX_UNZIP_SIZE:
-                return False
-    except:
-        return False
-    return True
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url)
+        filename = ydl.prepare_filename(info)
 
-def build_zip_tree(zip_path):
-    tree = defaultdict(list)
-    with zipfile.ZipFile(zip_path, "r") as z:
-        for name in z.namelist():
-            if name.endswith("/"):
-                continue
-            parts = name.split("/")
-            folder = " / ".join(parts[:-1]) if len(parts) > 1 else "root"
-            tree[folder].append(parts[-1])
-    return tree
+    if os.path.getsize(filename) > 25 * 1024 * 1024:
+        os.unlink(filename)
+        return await interaction.followup.send("❌ File terlalu besar untuk Discord")
 
-def format_zip_tree(tree, bad_files, max_lines=25):
-    lines, count = [], 0
-    for folder, files in tree.items():
-        lines.append(f"📁 {folder}")
-        for f in files:
-            icon = "🔴" if f in bad_files else "🟢"
-            lines.append(f"   └─ {icon} {f}")
-            count += 1
-            if count >= max_lines:
-                lines.append("   … (dipotong)")
-                return "\n".join(lines)
-    return "\n".join(lines)
+    await interaction.followup.send(file=discord.File(filename))
+    os.unlink(filename)
 
-def scan_zip(zip_path):
-    infected = False
-    bad_files = []
+# ======================
+# ERROR HANDLER
+# ======================
+@bot.tree.error
+async def on_error(interaction, error):
+    if interaction.response.is_done():
+        await interaction.followup.send("❌ Terjadi error", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Terjadi error", ephemeral=True)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(tmp)
-
-        for root, _, files in os.walk(tmp):
-            for f in files:
-                if f.endswith((".lua", ".luac")):
-                    try:
-                        with open(os.path.join(root, f), "r", errors="ignore") as file:
-                            scan = scan_content(file.read())
-                        if any(scan.values()):
-                            infected = True
-                            bad_files.append(f)
-                    except:
-                        pass
-    return infected, bad_files
-
-# ================= OBFUSCATOR =================
-def obf_low(code):
-    return re.sub(r'--.*', '', code)
-
-def obf_medium(code):
-    encoded = base64.b64encode(code.encode()).decode()
-    return f'loadstring(require("mime").unb64("{encoded}"))()'
-
-def obf_hard(code):
-    encoded = base64.b64encode(code.encode()).decode()
-    junk = "".join(random.choices(string.ascii_letters, k=25))
-    return f'''
-local {junk}="{encoded}"
-local f=loadstring(require("mime").unb64({junk}))
-f()
-'''
-
-class ObfView(discord.ui.View):
-    def __init__(self, code, filename):
-        super().__init__(timeout=90)
-        self.code = code
-        self.filename = filename
-
-    async def disable_all(self, interaction):
-        for item in self.children:
-            item.disabled = True
-        await interaction.message.edit(view=self)
-
-    @discord.ui.button(label="Low", emoji="🟢", style=discord.ButtonStyle.success)
-    async def low(self, interaction, button):
-        await interaction.response.send_message(
-            file=discord.File(
-                fp=obf_low(self.code).encode(),
-                filename=f"obf_low_{self.filename}"
-            ),
-            ephemeral=True
-        )
-        await self.disable_all(interaction)
-
-    @discord.ui.button(label="Medium", emoji="🟡", style=discord.ButtonStyle.primary)
-    async def medium(self, interaction, button):
-        await interaction.response.send_message(
-            file=discord.File(
-                fp=obf_medium(self.code).encode(),
-                filename=f"obf_medium_{self.filename}"
-            ),
-            ephemeral=True
-        )
-        await self.disable_all(interaction)
-
-    @discord.ui.button(label="Hard", emoji="🔴", style=discord.ButtonStyle.danger)
-    async def hard(self, interaction, button):
-        await interaction.response.send_message(
-            file=discord.File(
-                fp=obf_hard(self.code).encode(),
-                filename=f"obf_hard_{self.filename}"
-            ),
-            ephemeral=True
-        )
-        await self.disable_all(interaction)
-
-# ================= EVENTS =================
+# ======================
+# READY
+# ======================
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"✅ Bot online sebagai {bot.user}")
+    print("Bot Ready!")
 
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
-    if message.channel.id != SCAN_CHANNEL_ID:
-        return
-
-    for att in message.attachments:
-        name = att.filename.lower()
-        if not name.endswith(ALLOWED_EXT):
-            return
-
-        if name.endswith(".zip"):
-            if att.size > MAX_SIZE:
-                await message.reply("❌ ZIP melebihi 7MB")
-                return
-
-            path = f"tmp_{att.filename}"
-            await att.save(path)
-
-            if not zip_safe(path):
-                os.remove(path)
-                await message.reply("🧨 **ZIP Bomb terdeteksi!**")
-                return
-
-            infected, bad_files = scan_zip(path)
-            tree = build_zip_tree(path)
-
-            embed = discord.Embed(
-                title="🛡️ ZIP Scan Result",
-                color=0xe74c3c if infected else 0x2ecc71
-            )
-            embed.add_field(name="📦 File", value=att.filename, inline=False)
-            embed.add_field(name="📊 Status", value="🔴 BAHAYA" if infected else "🟢 AMAN")
-            embed.add_field(
-                name="🌳 Struktur",
-                value=f"```{format_zip_tree(tree, bad_files)}```",
-                inline=False
-            )
-
-            await message.reply(embed=embed)
-            os.remove(path)
-            return
-
-        if name.endswith((".lua", ".luac")):
-            code = (await att.read()).decode(errors="ignore")
-            scan = scan_content(code)
-            infected = any(scan.values())
-
-            embed = discord.Embed(
-                title="🛡️ Lua Scan Result",
-                color=0xe74c3c if infected else 0x2ecc71
-            )
-            embed.add_field(name="📄 File", value=att.filename, inline=False)
-            embed.add_field(name="📊 Status", value="🔴 BAHAYA" if infected else "🟢 AMAN")
-            embed.add_field(
-                name="🔍 Detail",
-                value=(
-                    f"🧠 Keylogger : {'✅' if scan['keylogger'] else '❌'}\n"
-                    f"🔗 Webhook   : {'✅' if scan['webhook'] else '❌'}\n"
-                    f"✈️ Telegram : {'✅' if scan['telegram'] else '❌'}\n"
-                    f"⚠️ Dangerous: {'✅' if scan['danger'] else '❌'}"
-                ),
-                inline=False
-            )
-
-            await message.reply(embed=embed, view=ObfView(code, att.filename))
-            return
-
-# ================= SLASH COMMAND =================
-@bot.tree.command(name="ping", description="Cek latency bot")
-async def ping(interaction: discord.Interaction):
-    latency = round(bot.latency * 1000)
-    embed = discord.Embed(title="🏓 Pong!", color=0x3498db)
-    embed.add_field(name="📡 Latency", value=f"```{latency} ms```", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="menu", description="Menu fitur bot")
-async def menu(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🛡️ Tatang SA-MP Security Bot",
-        description="Scanner & Obfuscator Lua/Luac",
-        color=0x2ecc71
-    )
-    embed.add_field(
-        name="📂 File",
-        value="🟢 .lua\n🟢 .luac\n🟢 .zip",
-        inline=True
-    )
-    embed.add_field(
-        name="🔍 Deteksi",
-        value="🧠 Keylogger\n🔗 Webhook\n✈️ Telegram\n🧨 ZIP Bomb",
-        inline=True
-    )
-    embed.add_field(
-        name="🛠️ Fitur",
-        value="🌳 Tree ZIP\n🔐 Obfuscator\n🎛️ Button\n📊 Embed",
-        inline=False
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ================= RUN =================
 bot.run(TOKEN)
